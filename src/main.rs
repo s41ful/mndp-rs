@@ -1,8 +1,10 @@
 use std::env;
 use std::time::Duration;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::io;
 use std::io::{Cursor, Read};
+
+use socket2::{Domain, Protocol, Socket, Type};
 
 use pnet::datalink;
 use pnet::datalink::Channel;
@@ -84,6 +86,10 @@ fn read_u32_le(r: &mut Cursor<&[u8]>) -> io::Result<u32> {
 }
 
 pub fn decode_packet(buf: &[u8]) -> std::io::Result<MndpPacket> {
+    if buf.is_empty() {
+        ()
+    }
+
     let mut cur = Cursor::new(buf);
 
     let seq_no = read_u32_le(&mut cur)?;
@@ -141,7 +147,36 @@ pub fn decode_packet(buf: &[u8]) -> std::io::Result<MndpPacket> {
     Ok(MndpPacket { seq_no, parts })
 }
 
-fn main() -> () {
+fn bind_and_listen() {
+    let addr: SocketAddr = "0.0.0.0:5678".parse().unwrap();
+    let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+
+    socket.set_reuse_address(true).unwrap();
+    socket.bind(&addr.into()).unwrap();
+
+    let mut buff = Vec::with_capacity(1024);
+    println!("Listening on {:?}", addr);
+
+    loop {
+        let (readed, peer) = socket.recv_from(buff.spare_capacity_mut()).unwrap();
+
+        unsafe {
+            buff.set_len(readed);
+        }
+
+        println!("Getting connection, readed {} bytes, from: {:?}", readed, peer.as_socket().unwrap());
+
+        match decode_packet(&buff[0..readed]) {
+            Ok(mndp_packet) => {
+                println!("{:?}", mndp_packet)
+            } 
+            Err(err) => println!("error while decoding packet {err}")
+        }
+    }
+}
+
+fn listen_on_raw_socket() -> () {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         println!("Usage: sudo cargo run -- <nama_interface>");
@@ -193,7 +228,7 @@ fn main() -> () {
                                                     Ok(mndp_packet) => {
                                                         println!("{:?}", mndp_packet)
                                                     } 
-                                                    Err(err) => println!("{err}")
+                                                    Err(err) => println!("error while decoding packet {err}")
                                                 }
                                             },
                                             _ => {}
@@ -209,4 +244,8 @@ fn main() -> () {
             Err(e) => eprintln!("Failed to receive packet: {}", e),
         }
     }
+}
+
+fn main() -> () {
+    bind_and_listen();
 }
