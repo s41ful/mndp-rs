@@ -3,6 +3,10 @@ name = "mndp-rs"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "mndp"
+path = "cli/main.rs"
+
 [dependencies]
 pnet = "0.35.0"
 socket2 = "0.5"

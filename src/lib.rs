@@ -23,6 +23,39 @@ pub struct MndpPacket {
 }
 
 #[derive(Debug)]
+pub struct Device {
+    pub identity: String,
+    pub mac_address: MacAddr,
+    pub version: String,
+    pub platform: String,
+    pub uptime: Duration,
+    pub software_id: String,
+    pub board: String,
+    pub unpack: Vec<u8>,
+    pub ipv6_address: Ipv6Addr,
+    pub interface_name: String,
+    pub ipv4_address: Ipv4Addr,
+}
+
+impl Device {
+    pub fn new() -> Self {
+        Self { 
+            identity: String::new(), 
+            mac_address: MacAddr::new(0, 0, 0, 0, 0, 0), 
+            version: String::new(),
+            platform: String::new(),
+            uptime: Duration::new(0, 0),
+            software_id: String::new(),
+            board: String::new(),
+            unpack: Vec::new(),
+            ipv6_address: Ipv6Addr::new(6, 0, 0, 0, 0, 0, 0, 0),
+            interface_name: String::new(),
+            ipv4_address: Ipv4Addr::new(0, 0, 0, 0)
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct MndpPart {
     pub ty: MndpTlvType,
     pub value: MndpValue,
@@ -52,6 +85,30 @@ pub enum MndpTlvType {
     InterfaceName,
     IPv4Address,
     Unknown(u16),
+}
+
+impl From<MndpPacket> for Device {
+    fn from(packet: MndpPacket) -> Self {
+        let mut device = Device::new();
+        let _ = packet.parts.iter().map(|part| {
+            match part.ty {
+               MndpTlvType::MacAddress => if let MndpValue::Mac(mac) = part.value { device.mac_address = mac },
+               MndpTlvType::Identity => if let MndpValue::String(ref identity) = part.value { device.identity = identity.clone()},
+               MndpTlvType::Version => if let MndpValue::String(ref version) = part.value { device.version = version.clone() },
+               MndpTlvType::Platform => if let MndpValue::String(ref platform) = part.value { device.platform = platform.clone() },
+               MndpTlvType::Uptime => if let MndpValue::Uptime(duration) = part.value { device.uptime = duration },
+               MndpTlvType::Board => if let MndpValue::Mac(mac) = part.value { device.mac_address = mac },
+               MndpTlvType::SoftwareId => if let MndpValue::String(ref software_id) = part.value { device.software_id = software_id.clone() },
+               MndpTlvType::Unpack => if let MndpValue::Uptime(dur) = part.value { device.uptime = dur },
+               MndpTlvType::IPv4Address => if let MndpValue::Ipv4(ip4) = part.value { device.ipv4_address = ip4 },
+               MndpTlvType::InterfaceName => if let MndpValue::String(ref interface) = part.value { device.interface_name = interface.clone() },
+               MndpTlvType::IPv6Address => if let MndpValue::Ipv6(ipv6) = part.value { device.ipv6_address = ipv6 },
+                _ => {},
+            }
+        });
+
+        device
+    }
 }
 
 impl From<u16> for MndpTlvType {
@@ -85,69 +142,89 @@ fn read_u32_le(r: &mut Cursor<&[u8]>) -> io::Result<u32> {
     Ok(u32::from_le_bytes(buf))
 }
 
-pub fn decode_packet(buf: &[u8]) -> std::io::Result<MndpPacket> {
+pub fn decode(buf: &[u8]) -> std::io::Result<Device> {
     if buf.is_empty() {
         ()
     }
 
     let mut cur = Cursor::new(buf);
 
-    let seq_no = read_u32_le(&mut cur)?;
-    let mut parts = Vec::new();
+    let _seq_no = read_u32_le(&mut cur)?;
+    // let mut parts = Vec::new();
+    let mut device = Device::new();
 
     while (cur.position() as usize) < buf.len() {
         let ty = MndpTlvType::from(read_u16_be(&mut cur)?);
         let len = read_u16_be(&mut cur)? as usize;
 
-        let value = match ty {
+        match ty {
             MndpTlvType::MacAddress => {
                 let mut mac = [0u8; 6];
                 cur.read_exact(&mut mac)?;
-                MndpValue::Mac(MacAddr::from(mac))
+                device.mac_address = MacAddr::from(mac);
             }
 
-            MndpTlvType::Identity
-            | MndpTlvType::Version
-            | MndpTlvType::Platform
-            | MndpTlvType::SoftwareId
-            | MndpTlvType::Board
-            | MndpTlvType::InterfaceName => {
+            MndpTlvType::Identity => {
                 let mut bytes = vec![0; len];
                 cur.read_exact(&mut bytes)?;
-                MndpValue::String(String::from_utf8_lossy(&bytes).into_owned())
+                device.identity = String::from_utf8_lossy(&bytes).into_owned();
+            }
+
+            MndpTlvType::Version => {
+                let mut bytes = vec![0; len];
+                cur.read_exact(&mut bytes)?;
+                device.version = String::from_utf8_lossy(&bytes).into_owned();
+            }
+            MndpTlvType::Platform => {
+                let mut bytes = vec![0; len];
+                cur.read_exact(&mut bytes)?;
+                device.platform = String::from_utf8_lossy(&bytes).into_owned();
+            }
+            MndpTlvType::SoftwareId => {
+                let mut bytes = vec![0; len];
+                cur.read_exact(&mut bytes)?;
+                device.software_id = String::from_utf8_lossy(&bytes).into_owned();
+            }
+            MndpTlvType::Board => {
+                let mut bytes = vec![0; len];
+                cur.read_exact(&mut bytes)?;
+                device.board = String::from_utf8_lossy(&bytes).into_owned();
+            }
+            MndpTlvType::InterfaceName => {
+                let mut bytes = vec![0; len];
+                cur.read_exact(&mut bytes)?;
+                device.interface_name = String::from_utf8_lossy(&bytes).into_owned();
             }
 
             MndpTlvType::Uptime => {
                 let secs = read_u32_le(&mut cur)?;
-                MndpValue::Uptime(Duration::from_secs(secs as u64))
+                device.uptime = Duration::from_secs(secs as u64);
             }
 
             MndpTlvType::IPv4Address => {
                 let mut ip = [0u8; 4];
                 cur.read_exact(&mut ip)?;
-                MndpValue::Ipv4(Ipv4Addr::from(ip))
+                device.ipv4_address = Ipv4Addr::from(ip);
+                println!("Get ipv4_address!!!")
             }
 
             MndpTlvType::IPv6Address => {
                 let mut ip = [0u8; 16];
                 cur.read_exact(&mut ip)?;
-                MndpValue::Ipv6(Ipv6Addr::from(ip))
+                device.ipv6_address = Ipv6Addr::from(ip);
             }
 
-            _ => {
+            _ => { 
                 let mut bytes = vec![0; len];
                 cur.read_exact(&mut bytes)?;
-                MndpValue::Bytes(bytes)
             }
         };
-
-        parts.push(MndpPart { ty, value });
     }
 
-    Ok(MndpPacket { seq_no, parts })
+    Ok(device)
 }
 
-fn bind_and_listen() {
+pub fn bind_and_listen() {
     let addr: SocketAddr = "0.0.0.0:5678".parse().unwrap();
     let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).unwrap();
@@ -167,7 +244,7 @@ fn bind_and_listen() {
 
         println!("Getting connection, readed {} bytes, from: {:?}", readed, peer.as_socket().unwrap());
 
-        match decode_packet(&buff[0..readed]) {
+        match decode(&buff[..]) {
             Ok(mndp_packet) => {
                 println!("{:?}", mndp_packet)
             } 
@@ -176,11 +253,11 @@ fn bind_and_listen() {
     }
 }
 
-fn listen_on_raw_socket() -> () {
+pub fn listen_on_raw_socket() -> () {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        println!("Usage: sudo cargo run -- <nama_interface>");
-        println!("Avaliable interface:");
+        println!("Usage: sudo cargo run -- <interface_name>");
+        println!("Available interface:");
         for iface in datalink::interfaces() {
             println!(" - {}", iface.name);
         }
@@ -224,7 +301,7 @@ fn listen_on_raw_socket() -> () {
                                                     dst_ip,
                                                     udp_packet.get_destination()
                                                 );
-                                                match decode_packet(udp_packet.payload()) {
+                                                match decode(udp_packet.payload()) {
                                                     Ok(mndp_packet) => {
                                                         println!("{:?}", mndp_packet)
                                                     } 
@@ -246,6 +323,6 @@ fn listen_on_raw_socket() -> () {
     }
 }
 
-fn main() -> () {
-    bind_and_listen();
+pub fn discover( /* TODO: add timeout parameter */ ) {
+
 }
