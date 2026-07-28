@@ -1,12 +1,13 @@
 use std::env;
+use std::error::Error;
 use std::time::Duration;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::io;
+use std::io::{self, ErrorKind};
 use std::io::{Cursor, Read};
 
 use socket2::{Domain, Protocol, Socket, Type};
 
-use pnet::datalink;
+use pnet::datalink::{self, Config};
 use pnet::datalink::Channel;
 use pnet::packet::Packet;
 use pnet::packet::ethernet::EtherTypes;
@@ -85,6 +86,12 @@ pub enum MndpTlvType {
     InterfaceName,
     IPv4Address,
     Unknown(u16),
+}
+
+#[derive(PartialEq, Debug)]
+pub enum MndpError {
+    InterfaceNotFound,
+    InterfaceDoesNotSpecified,
 }
 
 impl From<MndpPacket> for Device {
@@ -205,7 +212,6 @@ pub fn decode(buf: &[u8]) -> std::io::Result<Device> {
                 let mut ip = [0u8; 4];
                 cur.read_exact(&mut ip)?;
                 device.ipv4_address = Ipv4Addr::from(ip);
-                println!("Get ipv4_address!!!")
             }
 
             MndpTlvType::IPv6Address => {
@@ -224,36 +230,62 @@ pub fn decode(buf: &[u8]) -> std::io::Result<Device> {
     Ok(device)
 }
 
-pub fn bind_and_listen() {
+pub fn bind_and_listen(timeout: Duration) -> Result<Vec<Device>, MndpError> {
     let addr: SocketAddr = "0.0.0.0:5678".parse().unwrap();
     let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).unwrap();
 
     socket.set_reuse_address(true).unwrap();
     socket.bind(&addr.into()).unwrap();
+    socket.set_read_timeout(Some(timeout)).unwrap();
 
     let mut buff = Vec::with_capacity(1024);
     println!("Listening on {:?}", addr);
+    let mut devices: Vec<Device> = Vec::new();
 
     loop {
-        let (readed, peer) = socket.recv_from(buff.spare_capacity_mut()).unwrap();
+        match socket.recv_from(buff.spare_capacity_mut()) {
+            Ok((readed, peer)) => {
+                unsafe {
+                    buff.set_len(readed);
+                }
+                println!("Getting connection, readed {} bytes, from: {:?}", readed, peer.as_socket().unwrap());
 
-        unsafe {
-            buff.set_len(readed);
-        }
+                match decode(&buff[..]) {
+                    Ok(mndp_packet) => {
+                        println!("{:?}", mndp_packet);
+                        devices.push(mndp_packet);
+                    } 
+                    Err(err) => println!("error while decoding packet {err}")
+                }
 
-        println!("Getting connection, readed {} bytes, from: {:?}", readed, peer.as_socket().unwrap());
-
-        match decode(&buff[..]) {
-            Ok(mndp_packet) => {
-                println!("{:?}", mndp_packet)
             } 
-            Err(err) => println!("error while decoding packet {err}")
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => { return Ok(devices); }
+
+            _ => {}
         }
     }
 }
 
-pub fn listen_on_raw_socket() -> () {
+fn get_ipv4_packet<'a>(ether_packet: &'a EthernetPacket<'a>) -> Result<Ipv4Packet<'a>, ()>{
+    if ether_packet.get_ethertype() == EtherTypes::Ipv4 {
+        if let Some(ipv4_packet) = Ipv4Packet::new(ether_packet.payload()) {
+            return Ok(ipv4_packet);
+        }
+    }
+    Err(())
+}
+
+fn get_udp_packet<'a>(ip_packet: &'a Ipv4Packet<'a>) -> Result<UdpPacket<'a>, ()> {
+    if ip_packet.get_next_level_protocol() == IpNextHeaderProtocols::Udp {
+        if let Some(udp_packet) = UdpPacket::new(ip_packet.payload()) {
+            return Ok(udp_packet)
+        }
+    }
+    Err(())
+}
+
+pub fn listen_on_raw_socket(timeout: Duration) -> Result<Vec<Device>, MndpError> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         println!("Usage: sudo cargo run -- <interface_name>");
@@ -261,10 +293,10 @@ pub fn listen_on_raw_socket() -> () {
         for iface in datalink::interfaces() {
             println!(" - {}", iface.name);
         }
-        return;
+        return Err(MndpError::InterfaceDoesNotSpecified);
     }
-    let interface_name = &args[1];
 
+    let interface_name = &args[1];
     let interfaces = datalink::interfaces();
     let interface = interfaces
         .into_iter()
@@ -272,53 +304,46 @@ pub fn listen_on_raw_socket() -> () {
         .next()
         .expect("Interface not found!");
 
-    let (_tx, mut rx) = match datalink::channel(&interface, Default::default()) {
+    let mut config: Config = Default::default();
+    config.read_timeout = Some(timeout);
+
+    let (_tx, mut rx) = match datalink::channel(&interface, config) {
         Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
         Ok(_) => panic!("Unsupported channel"),
         Err(e) => panic!("Failed to open channel: {}", e),
     };
 
     println!("Listening & Filtering packet in {}...", interface.name);
+    let mut devices: Vec<Device> = Vec::new();
 
     loop {
         match rx.next() {
             Ok(packet) => {
-                if let Some(ethernet_packet) = EthernetPacket::new(packet) {
-                    if ethernet_packet.get_ethertype() == EtherTypes::Ipv4 {
-                        if let Some(ipv4_packet) = Ipv4Packet::new(ethernet_packet.payload()) {
-                            let src_ip = ipv4_packet.get_source();
-                            let dst_ip = ipv4_packet.get_destination();
-                            match ipv4_packet.get_next_level_protocol() {
-                                IpNextHeaderProtocols::Udp => {
-                                    if let Some(udp_packet) = UdpPacket::new(ipv4_packet.payload())
-                                    {
-                                        match udp_packet.get_destination() {
-                                            5678 => {
-                                                println!(
-                                                    "[UDP] {}:{} -> {}:{}",
-                                                    src_ip,
-                                                    udp_packet.get_source(),
-                                                    dst_ip,
-                                                    udp_packet.get_destination()
-                                                );
-                                                match decode(udp_packet.payload()) {
-                                                    Ok(mndp_packet) => {
-                                                        println!("{:?}", mndp_packet)
-                                                    } 
-                                                    Err(err) => println!("error while decoding packet {err}")
-                                                }
-                                            },
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
+                let Some(ethernet_packet) = EthernetPacket::new(packet) else { continue };
+                let Ok(ipv4_packet) = get_ipv4_packet(&ethernet_packet) else { continue };
+                let Ok(udp_packet) = get_udp_packet(&ipv4_packet) else { continue };
+                match udp_packet.get_destination() {
+                    5678 => {
+                        println!(
+                            "[MNDP] {}:{} -> {}:{}",
+                            ipv4_packet.get_source(),
+                            udp_packet.get_source(),
+                            ipv4_packet.get_destination(),
+                            udp_packet.get_destination()
+                        );
+                        match decode(udp_packet.payload()) {
+                            Ok(mndp_packet) => {
+                                println!("{:?}", mndp_packet);
+                                devices.push(mndp_packet);
+                            } 
+                            Err(err) => println!("decode err: {err}")
                         }
-                    }
+                    },
+                    _ => {}
                 }
             }
-            Err(e) => eprintln!("Failed to receive packet: {}", e),
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => { return Ok(devices); }
+            _ => {}
         }
     }
 }
