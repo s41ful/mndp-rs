@@ -1,7 +1,5 @@
-use std::env;
-use std::error::Error;
 use std::time::Duration;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{AddrParseError, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::io::{self, ErrorKind};
 use std::io::{Cursor, Read};
 
@@ -16,6 +14,8 @@ use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::udp::UdpPacket;
 use pnet::util::MacAddr;
+
+static MNDP_LISTEN_PORT: &'static str = "0.0.0.0:5678";
 
 #[derive(Debug)]
 pub struct MndpPacket {
@@ -36,6 +36,24 @@ pub struct Device {
     pub ipv6_address: Ipv6Addr,
     pub interface_name: String,
     pub ipv4_address: Ipv4Addr,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct MndpConfig {
+    pub interface: Option<String>,
+    pub raw_socket: bool,
+    pub timeout: Duration,
+}
+
+#[derive(Debug)]
+pub struct Listener {
+    pub config: MndpConfig,
+}
+
+impl MndpConfig {
+    pub fn new() -> Self {
+        Self { interface: None, raw_socket: false, timeout: Duration::from_secs(20) }
+    }
 }
 
 impl Device {
@@ -88,10 +106,14 @@ pub enum MndpTlvType {
     Unknown(u16),
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(Debug)]
 pub enum MndpError {
+    ParseAddrError(AddrParseError),
+    Other(std::io::Error),
     InterfaceNotFound,
     InterfaceDoesNotSpecified,
+    UnsupportedChannel,
+    EthernetChannelError(std::io::Error),
 }
 
 impl From<MndpPacket> for Device {
@@ -100,15 +122,15 @@ impl From<MndpPacket> for Device {
         let _ = packet.parts.iter().map(|part| {
             match part.ty {
                MndpTlvType::MacAddress => if let MndpValue::Mac(mac) = part.value { device.mac_address = mac },
-               MndpTlvType::Identity => if let MndpValue::String(ref identity) = part.value { device.identity = identity.clone()},
-               MndpTlvType::Version => if let MndpValue::String(ref version) = part.value { device.version = version.clone() },
-               MndpTlvType::Platform => if let MndpValue::String(ref platform) = part.value { device.platform = platform.clone() },
+               MndpTlvType::Identity => if let MndpValue::String(ref identity) = part.value { device.identity = String::from(identity)},
+               MndpTlvType::Version => if let MndpValue::String(ref version) = part.value { device.version = String::from(version) },
+               MndpTlvType::Platform => if let MndpValue::String(ref platform) = part.value { device.platform = String::from(platform) },
                MndpTlvType::Uptime => if let MndpValue::Uptime(duration) = part.value { device.uptime = duration },
                MndpTlvType::Board => if let MndpValue::Mac(mac) = part.value { device.mac_address = mac },
-               MndpTlvType::SoftwareId => if let MndpValue::String(ref software_id) = part.value { device.software_id = software_id.clone() },
+               MndpTlvType::SoftwareId => if let MndpValue::String(ref software_id) = part.value { device.software_id = String::from(software_id) },
                MndpTlvType::Unpack => if let MndpValue::Uptime(dur) = part.value { device.uptime = dur },
                MndpTlvType::IPv4Address => if let MndpValue::Ipv4(ip4) = part.value { device.ipv4_address = ip4 },
-               MndpTlvType::InterfaceName => if let MndpValue::String(ref interface) = part.value { device.interface_name = interface.clone() },
+               MndpTlvType::InterfaceName => if let MndpValue::String(ref interface) = part.value { device.interface_name = String::from(interface) },
                MndpTlvType::IPv6Address => if let MndpValue::Ipv6(ipv6) = part.value { device.ipv6_address = ipv6 },
                 _ => {},
             }
@@ -155,7 +177,6 @@ pub fn decode(buf: &[u8]) -> std::io::Result<Device> {
     }
 
     let mut cur = Cursor::new(buf);
-
     let _seq_no = read_u32_le(&mut cur)?;
     // let mut parts = Vec::new();
     let mut device = Device::new();
@@ -182,21 +203,25 @@ pub fn decode(buf: &[u8]) -> std::io::Result<Device> {
                 cur.read_exact(&mut bytes)?;
                 device.version = String::from_utf8_lossy(&bytes).into_owned();
             }
+
             MndpTlvType::Platform => {
                 let mut bytes = vec![0; len];
                 cur.read_exact(&mut bytes)?;
                 device.platform = String::from_utf8_lossy(&bytes).into_owned();
             }
+
             MndpTlvType::SoftwareId => {
                 let mut bytes = vec![0; len];
                 cur.read_exact(&mut bytes)?;
                 device.software_id = String::from_utf8_lossy(&bytes).into_owned();
             }
+
             MndpTlvType::Board => {
                 let mut bytes = vec![0; len];
                 cur.read_exact(&mut bytes)?;
                 device.board = String::from_utf8_lossy(&bytes).into_owned();
             }
+
             MndpTlvType::InterfaceName => {
                 let mut bytes = vec![0; len];
                 cur.read_exact(&mut bytes)?;
@@ -230,14 +255,15 @@ pub fn decode(buf: &[u8]) -> std::io::Result<Device> {
     Ok(device)
 }
 
-pub fn bind_and_listen(timeout: Duration) -> Result<Vec<Device>, MndpError> {
-    let addr: SocketAddr = "0.0.0.0:5678".parse().unwrap();
-    let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).unwrap();
 
-    socket.set_reuse_address(true).unwrap();
-    socket.bind(&addr.into()).unwrap();
-    socket.set_read_timeout(Some(timeout)).unwrap();
+pub fn bind_and_listen(timeout: Duration) -> Result<Vec<Device>, MndpError> {
+    let addr: SocketAddr = MNDP_LISTEN_PORT.parse().map_err(MndpError::ParseAddrError)?;
+    let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).map_err(MndpError::Other)?;
+
+    socket.set_reuse_address(true).map_err(MndpError::Other)?;
+    socket.bind(&addr.into()).map_err(MndpError::Other)?;
+    socket.set_read_timeout(Some(timeout)).map_err(MndpError::Other)?;
 
     let mut buff = Vec::with_capacity(1024);
     println!("Listening on {:?}", addr);
@@ -245,11 +271,10 @@ pub fn bind_and_listen(timeout: Duration) -> Result<Vec<Device>, MndpError> {
 
     loop {
         match socket.recv_from(buff.spare_capacity_mut()) {
-            Ok((readed, peer)) => {
+            Ok((readed, _peer)) => {
                 unsafe {
                     buff.set_len(readed);
                 }
-                println!("Getting connection, readed {} bytes, from: {:?}", readed, peer.as_socket().unwrap());
 
                 match decode(&buff[..]) {
                     Ok(mndp_packet) => {
@@ -258,7 +283,6 @@ pub fn bind_and_listen(timeout: Duration) -> Result<Vec<Device>, MndpError> {
                     } 
                     Err(err) => println!("error while decoding packet {err}")
                 }
-
             } 
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => { return Ok(devices); }
 
@@ -273,6 +297,7 @@ fn get_ipv4_packet<'a>(ether_packet: &'a EthernetPacket<'a>) -> Result<Ipv4Packe
             return Ok(ipv4_packet);
         }
     }
+
     Err(())
 }
 
@@ -282,21 +307,40 @@ fn get_udp_packet<'a>(ip_packet: &'a Ipv4Packet<'a>) -> Result<UdpPacket<'a>, ()
             return Ok(udp_packet)
         }
     }
+
     Err(())
 }
 
-pub fn listen_on_raw_socket(timeout: Duration) -> Result<Vec<Device>, MndpError> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        println!("Usage: sudo cargo run -- <interface_name>");
-        println!("Available interface:");
-        for iface in datalink::interfaces() {
-            println!(" - {}", iface.name);
+fn parse_str_time(mut timeout: String) -> Duration {
+    if timeout.ends_with("s") {
+        timeout.pop();
+        return Duration::from_secs(timeout.parse().unwrap())
+    } else {
+        Duration::from_secs(20)
+    }
+}
+
+pub fn parse_args(args: Vec<String>) -> MndpConfig {
+    let mut config = MndpConfig::new();
+
+    for i in 0..args.len() {
+        match args[i].as_str() {
+            "-i" => {
+                config.raw_socket = true;
+                config.interface = Some(String::from(&args[i + 1]));
+            },
+            "-t" => {
+                config.timeout = parse_str_time(String::from(&args[i + 1]))
+            },
+            _ => {}
         }
-        return Err(MndpError::InterfaceDoesNotSpecified);
     }
 
-    let interface_name = &args[1];
+    config
+}
+
+pub fn listen_on_raw_socket(timeout: Duration, interface: &String) -> Result<Vec<Device>, MndpError> {
+    let interface_name = interface;
     let interfaces = datalink::interfaces();
     let interface = interfaces
         .into_iter()
@@ -309,11 +353,12 @@ pub fn listen_on_raw_socket(timeout: Duration) -> Result<Vec<Device>, MndpError>
 
     let (_tx, mut rx) = match datalink::channel(&interface, config) {
         Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
-        Ok(_) => panic!("Unsupported channel"),
-        Err(e) => panic!("Failed to open channel: {}", e),
+        Ok(_) => return Err(MndpError::UnsupportedChannel),
+        Err(e) => return Err(MndpError::EthernetChannelError(e)),
     };
 
     println!("Listening & Filtering packet in {}...", interface.name);
+
     let mut devices: Vec<Device> = Vec::new();
 
     loop {
@@ -348,6 +393,35 @@ pub fn listen_on_raw_socket(timeout: Duration) -> Result<Vec<Device>, MndpError>
     }
 }
 
-pub fn discover( /* TODO: add timeout parameter */ ) {
+impl Listener {
+    pub fn new(config: MndpConfig) -> Self {
+        Self { config: config }
+    }
 
+    pub fn discover(&mut self) -> Result<Vec<Device>, MndpError> {
+        if self.config.raw_socket {
+            listen_on_raw_socket(self.config.timeout, self.config.interface.as_ref().expect("interface not specified"))
+        } else {
+            bind_and_listen(self.config.timeout)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_str_time() {
+        let result = parse_str_time(String::from("5s"));
+        assert_eq!(result, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_parse_args() {
+        let result = parse_args(vec!["./mndp", "-t", "6s", "-i", "enp3s0"].iter().map(|s| {
+            s.to_string()
+        }).collect());
+        assert_eq!(result, MndpConfig { interface: Some(String::from("enp3s0")), timeout: Duration::from_secs(6), raw_socket: true})
+    }
 }

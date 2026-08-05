@@ -1,7 +1,8 @@
-use std::time::Duration;
+use std::env;
+use mndp_rs::parse_args;
 
 fn main() -> () {
-    mndp_rs::bind_and_listen(Duration::from_secs(5)).unwrap();
-
-    ()
+    let args: Vec<String> = env::args().collect();
+    let mut listener: mndp_rs::Listener = mndp_rs::Listener::new(parse_args(args)); 
+    println!("Devices: {:?}", listener.discover())
 }
