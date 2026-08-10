@@ -255,8 +255,7 @@ pub fn decode(buf: &[u8]) -> std::io::Result<Device> {
     Ok(device)
 }
 
-
-pub fn bind_and_listen(timeout: Duration) -> Result<Vec<Device>, MndpError> {
+pub fn bind_and_listen(timeout: Duration) -> Result<Option<Vec<Device>>, MndpError> {
     let addr: SocketAddr = MNDP_LISTEN_PORT.parse().map_err(MndpError::ParseAddrError)?;
     let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).map_err(MndpError::Other)?;
@@ -284,7 +283,14 @@ pub fn bind_and_listen(timeout: Duration) -> Result<Vec<Device>, MndpError> {
                     Err(err) => println!("error while decoding packet {err}")
                 }
             } 
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => { return Ok(devices); }
+            Err(e) if e.kind() == ErrorKind::WouldBlock 
+                || e.kind() == ErrorKind::TimedOut => { 
+                    if devices.is_empty() {
+                        return Ok(None);
+                    } else {
+                        return Ok(Some(devices))
+                    }
+                }
 
             _ => {}
         }
@@ -311,35 +317,7 @@ fn get_udp_packet<'a>(ip_packet: &'a Ipv4Packet<'a>) -> Result<UdpPacket<'a>, ()
     Err(())
 }
 
-fn parse_str_time(mut timeout: String) -> Duration {
-    if timeout.ends_with("s") {
-        timeout.pop();
-        return Duration::from_secs(timeout.parse().unwrap())
-    } else {
-        Duration::from_secs(20)
-    }
-}
-
-pub fn parse_args(args: Vec<String>) -> MndpConfig {
-    let mut config = MndpConfig::new();
-
-    for i in 0..args.len() {
-        match args[i].as_str() {
-            "-i" => {
-                config.raw_socket = true;
-                config.interface = Some(String::from(&args[i + 1]));
-            },
-            "-t" => {
-                config.timeout = parse_str_time(String::from(&args[i + 1]))
-            },
-            _ => {}
-        }
-    }
-
-    config
-}
-
-pub fn listen_on_raw_socket(timeout: Duration, interface: &String) -> Result<Vec<Device>, MndpError> {
+pub fn listen_on_raw_socket(timeout: Duration, interface: &String) -> Result<Option<Vec<Device>>, MndpError> {
     let interface_name = interface;
     let interfaces = datalink::interfaces();
     let interface = interfaces
@@ -387,7 +365,14 @@ pub fn listen_on_raw_socket(timeout: Duration, interface: &String) -> Result<Vec
                     _ => {}
                 }
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => { return Ok(devices); }
+            Err(e) if e.kind() == ErrorKind::WouldBlock 
+                || e.kind() == ErrorKind::TimedOut => { 
+                    if devices.is_empty() {
+                        return Ok(None)
+                    } else {
+                        return Ok(Some(devices))
+                    }
+                }
             _ => {}
         }
     }
@@ -398,30 +383,11 @@ impl Listener {
         Self { config: config }
     }
 
-    pub fn discover(&mut self) -> Result<Vec<Device>, MndpError> {
+    pub fn discover(&mut self) -> Result<Option<Vec<Device>>, MndpError> {
         if self.config.raw_socket {
             listen_on_raw_socket(self.config.timeout, self.config.interface.as_ref().expect("interface not specified"))
         } else {
             bind_and_listen(self.config.timeout)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_str_time() {
-        let result = parse_str_time(String::from("5s"));
-        assert_eq!(result, Duration::from_secs(5));
-    }
-
-    #[test]
-    fn test_parse_args() {
-        let result = parse_args(vec!["./mndp", "-t", "6s", "-i", "enp3s0"].iter().map(|s| {
-            s.to_string()
-        }).collect());
-        assert_eq!(result, MndpConfig { interface: Some(String::from("enp3s0")), timeout: Duration::from_secs(6), raw_socket: true})
     }
 }
