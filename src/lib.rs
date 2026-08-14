@@ -15,7 +15,7 @@ use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::udp::UdpPacket;
 use pnet::util::MacAddr;
 
-static MNDP_LISTEN_PORT: &'static str = "0.0.0.0:5678";
+static MNDP_LISTEN_PORT: &str = "0.0.0.0:5678";
 
 #[derive(Debug)]
 pub struct MndpPacket {
@@ -56,6 +56,12 @@ impl MndpConfig {
     }
 }
 
+impl Default for MndpConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Device {
     pub fn new() -> Self {
         Self { 
@@ -71,6 +77,12 @@ impl Device {
             interface_name: String::new(),
             ipv4_address: Ipv4Addr::new(0, 0, 0, 0)
         }
+    }
+}
+
+impl Default for Device {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -173,7 +185,7 @@ fn read_u32_le(r: &mut Cursor<&[u8]>) -> io::Result<u32> {
 
 pub fn decode(buf: &[u8]) -> std::io::Result<Device> {
     if buf.is_empty() {
-        ()
+        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "empty buffer"));
     }
 
     let mut cur = Cursor::new(buf);
@@ -298,36 +310,38 @@ pub fn bind_and_listen(timeout: Duration) -> Result<Option<Vec<Device>>, MndpErr
 }
 
 fn get_ipv4_packet<'a>(ether_packet: &'a EthernetPacket<'a>) -> Result<Ipv4Packet<'a>, ()>{
-    if ether_packet.get_ethertype() == EtherTypes::Ipv4 {
-        if let Some(ipv4_packet) = Ipv4Packet::new(ether_packet.payload()) {
-            return Ok(ipv4_packet);
-        }
+    if ether_packet.get_ethertype() == EtherTypes::Ipv4
+        && let Some(ipv4_packet) = Ipv4Packet::new(ether_packet.payload())
+    {
+        return Ok(ipv4_packet);
     }
 
     Err(())
 }
 
 fn get_udp_packet<'a>(ip_packet: &'a Ipv4Packet<'a>) -> Result<UdpPacket<'a>, ()> {
-    if ip_packet.get_next_level_protocol() == IpNextHeaderProtocols::Udp {
-        if let Some(udp_packet) = UdpPacket::new(ip_packet.payload()) {
-            return Ok(udp_packet)
-        }
+    if ip_packet.get_next_level_protocol() == IpNextHeaderProtocols::Udp
+        && let Some(udp_packet) = UdpPacket::new(ip_packet.payload())
+    {
+        return Ok(udp_packet);
     }
 
     Err(())
 }
 
+
 pub fn listen_on_raw_socket(timeout: Duration, interface: &String) -> Result<Option<Vec<Device>>, MndpError> {
     let interface_name = interface;
     let interfaces = datalink::interfaces();
     let interface = interfaces
-        .into_iter()
-        .filter(|iface| iface.name == *interface_name)
-        .next()
-        .expect("Interface not found!");
+    .into_iter()
+    .find(|iface| iface.name == *interface_name)
+    .expect("Interface not found!");
 
-    let mut config: Config = Default::default();
-    config.read_timeout = Some(timeout);
+    let config: Config = Config {
+        read_timeout: Some(timeout),
+        ..Default::default()
+    };
 
     let (_tx, mut rx) = match datalink::channel(&interface, config) {
         Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
@@ -345,26 +359,24 @@ pub fn listen_on_raw_socket(timeout: Duration, interface: &String) -> Result<Opt
                 let Some(ethernet_packet) = EthernetPacket::new(packet) else { continue };
                 let Ok(ipv4_packet) = get_ipv4_packet(&ethernet_packet) else { continue };
                 let Ok(udp_packet) = get_udp_packet(&ipv4_packet) else { continue };
-                match udp_packet.get_destination() {
-                    5678 => {
-                        println!(
-                            "[MNDP] {}:{} -> {}:{}",
-                            ipv4_packet.get_source(),
-                            udp_packet.get_source(),
-                            ipv4_packet.get_destination(),
-                            udp_packet.get_destination()
-                        );
-                        match decode(udp_packet.payload()) {
-                            Ok(mndp_packet) => {
-                                println!("{:?}", mndp_packet);
-                                devices.push(mndp_packet);
-                            } 
-                            Err(err) => println!("decode err: {err}")
+                if udp_packet.get_destination() == 5678 {
+                    println!(
+                        "[MNDP] {}:{} -> {}:{}",
+                        ipv4_packet.get_source(),
+                        udp_packet.get_source(),
+                        ipv4_packet.get_destination(),
+                        udp_packet.get_destination()
+                    );
+                    match decode(udp_packet.payload()) {
+                        Ok(mndp_packet) => {
+                            println!("{:?}", mndp_packet);
+                            devices.push(mndp_packet);
                         }
-                    },
-                    _ => {}
+                        Err(err) => println!("decode err: {err}"),
+                    }
                 }
             }
+
             Err(e) if e.kind() == ErrorKind::WouldBlock 
                 || e.kind() == ErrorKind::TimedOut => { 
                     if devices.is_empty() {
@@ -380,7 +392,7 @@ pub fn listen_on_raw_socket(timeout: Duration, interface: &String) -> Result<Opt
 
 impl Listener {
     pub fn new(config: MndpConfig) -> Self {
-        Self { config: config }
+        Self { config }
     }
 
     pub fn discover(&mut self) -> Result<Option<Vec<Device>>, MndpError> {

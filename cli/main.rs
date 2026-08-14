@@ -5,7 +5,7 @@ use mndp_rs::{MndpConfig, };
 fn parse_str_time(mut timeout: String) -> Duration {
     if timeout.ends_with("s") {
         timeout.pop();
-        return Duration::from_secs(timeout.parse().unwrap())
+        Duration::from_secs(timeout.parse().unwrap())
     } else {
         Duration::from_secs(20)
     }
@@ -60,7 +60,7 @@ fn parse_args(args: Vec<String>) -> MndpConfig {
     config
 }
 
-fn main() -> () {
+fn main() {
     let args: Vec<String> = env::args().collect();
     let mut listener: mndp_rs::Listener = mndp_rs::Listener::new(parse_args(args)); 
     println!("Devices: {:?}", listener.discover())
