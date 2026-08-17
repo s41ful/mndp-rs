@@ -1,6 +1,6 @@
+use mndp_rs::MndpConfig;
 use std::env;
 use std::time::Duration;
-use mndp_rs::{MndpConfig, };
 
 fn parse_str_time(mut timeout: String) -> Duration {
     if timeout.ends_with("s") {
@@ -17,18 +17,18 @@ fn print_help() {
     } else if cfg!(target_os = "linux") {
         "root or CAP_NET_RAW capability required"
     } else {
-        "administrative privileges required" 
+        "administrative privileges required"
     };
 
     let help_message = format!(
-r#"mndp-rs 0.1.0, Mikrotik Network Discovery Protocol
+        r#"mndp-rs 0.1.0, Mikrotik Network Discovery Protocol
 Usage:
     mndp [OPTIONS]
 
 Options:
     -h, --help       show this help message
     -t <timeout>     set read timeout in seconds (default: 20s)
-    -i <interface>   specify interface for listening directly in Ethernet frames ({})"#, 
+    -i <interface>   specify interface for listening directly in Ethernet frames ({})"#,
         permission
     );
 
@@ -41,18 +41,13 @@ fn parse_args(args: Vec<String>) -> MndpConfig {
     for i in 0..args.len() {
         match args[i].as_str() {
             "-i" => {
-                config.raw_socket = true;
                 config.interface = Some(String::from(&args[i + 1]));
-            },
-            "-t" => {
-                config.timeout = parse_str_time(String::from(&args[i + 1]))
-            },
-            "--help" | 
-                "-h" |
-                "help"=> {
-                    print_help();
-                    std::process::exit(1);
-                }
+            }
+            "-t" => config.timeout = parse_str_time(String::from(&args[i + 1])),
+            "--help" | "-h" | "help" => {
+                print_help();
+                std::process::exit(1);
+            }
             _ => {}
         }
     }
@@ -62,7 +57,7 @@ fn parse_args(args: Vec<String>) -> MndpConfig {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let mut listener: mndp_rs::Listener = mndp_rs::Listener::new(parse_args(args)); 
+    let mut listener: mndp_rs::Listener = mndp_rs::Listener::new(parse_args(args));
     println!("Devices: {:?}", listener.discover())
 }
 
@@ -78,9 +73,19 @@ mod tests {
 
     #[test]
     fn test_parse_args() {
-        let result = parse_args(vec!["./mndp", "-t", "6s", "-i", "enp3s0"].iter().map(|s| {
-            s.to_string()
-        }).collect());
-        assert_eq!(result, MndpConfig { interface: Some(String::from("enp3s0")), timeout: Duration::from_secs(6), raw_socket: true})
+        let result = parse_args(
+            vec!["./mndp", "-t", "6s", "-i", "enp3s0"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        assert_eq!(
+            result,
+            MndpConfig {
+                interface: Some(String::from("enp3s0")),
+                timeout: Duration::from_secs(6),
+                raw_socket: true
+            }
+        )
     }
 }
