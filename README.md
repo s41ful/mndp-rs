@@ -9,7 +9,7 @@ Add `mndp-rs` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-mndp-rs = { git = "https://github.com/s41ful/mndp-rs.git" }
+mndp-rs = "0.1.1" 
 ```
 
 ## As a CLI tool
@@ -17,7 +17,7 @@ mndp-rs = { git = "https://github.com/s41ful/mndp-rs.git" }
 Install directly via cargo:
 
 ```bash
-cargo install --git https://github.com/s41ful/mndp-rs.git
+cargo install mndp-rs
 ```
 
 ## ⚙️ Prerequisites & Privileges

@@ -1,7 +1,19 @@
 [package]
 name = "mndp-rs"
-version = "0.1.0"
+version = "0.1.1"
+license = "MIT"
 edition = "2024"
+readme = "README.md"
+description = "A simple Rust library and CLI tool for discovering MikroTik devices on your local network using the MikroTik Neighbor Discovery Protocol (MNDP)."
+keywords = [
+    "mikrotik",
+    "router",
+    "mndp",
+]
+categories = [
+    "network-programming",
+]
+repository = "https://github.com/s41ful/mndp-rs.git"
 
 [[bin]]
 name = "mndp"
