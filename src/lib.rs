@@ -1,9 +1,10 @@
 use std::io::{self, ErrorKind};
 use std::io::{Cursor, Read};
 use std::net::{AddrParseError, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, Socket, Type};
+use tokio::sync::mpsc;
 
 use pnet::datalink::Channel;
 use pnet::datalink::{self, Config};
@@ -38,7 +39,7 @@ pub struct Device {
     pub ipv4_address: Ipv4Addr,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct MndpConfig {
     pub interface: Option<String>,
     pub timeout: Duration,
@@ -237,7 +238,6 @@ pub fn decode(buf: &[u8]) -> std::io::Result<Device> {
 
     let mut cur = Cursor::new(buf);
     let _seq_no = read_u32_le(&mut cur)?;
-    // let mut parts = Vec::new();
     let mut device = Device::new();
 
     while (cur.position() as usize) < buf.len() {
@@ -314,7 +314,7 @@ pub fn decode(buf: &[u8]) -> std::io::Result<Device> {
     Ok(device)
 }
 
-pub fn bind_and_listen(timeout: Duration) -> Result<Option<Vec<Device>>, MndpError> {
+fn bind_and_listen(timeout: Duration) -> Result<Option<Vec<Device>>, MndpError> {
     let addr: SocketAddr = MNDP_LISTEN_PORT
         .parse()
         .map_err(MndpError::ParseAddrError)?;
@@ -332,7 +332,6 @@ pub fn bind_and_listen(timeout: Duration) -> Result<Option<Vec<Device>>, MndpErr
         .map_err(MndpError::Other)?;
 
     let mut buff = Vec::with_capacity(1024);
-    println!("Listening on {:?}", addr);
     let mut devices: Vec<Device> = Vec::new();
 
     loop {
@@ -347,7 +346,7 @@ pub fn bind_and_listen(timeout: Duration) -> Result<Option<Vec<Device>>, MndpErr
                         println!("{:?}", mndp_packet);
                         devices.push(mndp_packet);
                     }
-                    Err(err) => println!("error while decoding packet {err}"),
+                    Err(_) => {}
                 }
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
@@ -383,7 +382,7 @@ fn get_udp_packet<'a>(ip_packet: &'a Ipv4Packet<'a>) -> Result<UdpPacket<'a>, ()
     Err(())
 }
 
-pub fn listen_on_raw_socket(
+fn listen_on_raw_socket(
     timeout: Duration,
     interface: &String,
 ) -> Result<Option<Vec<Device>>, MndpError> {
@@ -405,8 +404,6 @@ pub fn listen_on_raw_socket(
         Err(e) => return Err(MndpError::EthernetChannelError(e)),
     };
 
-    println!("Listening & Filtering packet in {}...", interface.name);
-
     let mut devices: Vec<Device> = Vec::new();
 
     loop {
@@ -422,19 +419,11 @@ pub fn listen_on_raw_socket(
                     continue;
                 };
                 if udp_packet.get_destination() == 5678 {
-                    println!(
-                        "[MNDP] {}:{} -> {}:{}",
-                        ipv4_packet.get_source(),
-                        udp_packet.get_source(),
-                        ipv4_packet.get_destination(),
-                        udp_packet.get_destination()
-                    );
                     match decode(udp_packet.payload()) {
                         Ok(mndp_packet) => {
-                            println!("{:?}", mndp_packet);
                             devices.push(mndp_packet);
                         }
-                        Err(err) => println!("decode err: {err}"),
+                        Err(_) => {}
                     }
                 }
             }
@@ -456,15 +445,43 @@ impl Listener {
         Self { config }
     }
 
-    pub fn discover(&mut self) -> Result<Option<Vec<Device>>, MndpError> {
+    pub fn start_discovery_stream(&self) -> mpsc::Receiver<Device> {
+        let (tx, rx) = mpsc::channel::<Device>(100);
+        let config = self.config.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let start_time = Instant::now();
+            let total_timeout = config.timeout;
+
+            loop {
+                if start_time.elapsed() >= total_timeout {
+                    break;
+                }
+
+                let micro_timeout = Duration::from_millis(100);
+
+                let result = if config.interface.is_some() {
+                    listen_on_raw_socket(micro_timeout, config.interface.as_ref().unwrap())
+                } else {
+                    bind_and_listen(micro_timeout)
+                };
+
+                if let Ok(Some(devices)) = result {
+                    for device in devices {
+                        if tx.blocking_send(device).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        rx
+    }
+
+    pub fn discover(&self) -> Result<Option<Vec<Device>>, MndpError> {
         if self.config.interface.is_some() {
-            listen_on_raw_socket(
-                self.config.timeout,
-                self.config
-                    .interface
-                    .as_ref()
-                    .expect("interface not specified"),
-            )
+            listen_on_raw_socket(self.config.timeout, self.config.interface.as_ref().unwrap())
         } else {
             bind_and_listen(self.config.timeout)
         }
