@@ -1,4 +1,4 @@
-use std::io::{self, ErrorKind};
+use std::io::{self, Error, ErrorKind};
 use std::io::{Cursor, Read};
 use std::net::{AddrParseError, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::mpsc;
 
-use pnet::datalink::Channel;
 use pnet::datalink::{self, Config};
+use pnet::datalink::{Channel, DataLinkReceiver};
 use pnet::packet::Packet;
 use pnet::packet::ethernet::EtherTypes;
 use pnet::packet::ethernet::EthernetPacket;
@@ -45,8 +45,9 @@ pub struct MndpConfig {
     pub timeout: Duration,
 }
 
-#[derive(Debug)]
 pub struct Listener {
+    rx: Option<Box<dyn DataLinkReceiver>>,
+    socket: Option<Socket>,
     pub config: MndpConfig,
 }
 
@@ -314,54 +315,6 @@ pub fn decode(buf: &[u8]) -> std::io::Result<Device> {
     Ok(device)
 }
 
-fn bind_and_listen(timeout: Duration) -> Result<Option<Vec<Device>>, MndpError> {
-    let addr: SocketAddr = MNDP_LISTEN_PORT
-        .parse()
-        .map_err(MndpError::ParseAddrError)?;
-    let domain = if addr.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).map_err(MndpError::Other)?;
-
-    socket.set_reuse_address(true).map_err(MndpError::Other)?;
-    socket.bind(&addr.into()).map_err(MndpError::Other)?;
-    socket
-        .set_read_timeout(Some(timeout))
-        .map_err(MndpError::Other)?;
-
-    let mut buff = Vec::with_capacity(1024);
-    let mut devices: Vec<Device> = Vec::new();
-
-    loop {
-        match socket.recv_from(buff.spare_capacity_mut()) {
-            Ok((readed, _peer)) => {
-                unsafe {
-                    buff.set_len(readed);
-                }
-
-                match decode(&buff[..]) {
-                    Ok(mndp_packet) => {
-                        println!("{:?}", mndp_packet);
-                        devices.push(mndp_packet);
-                    }
-                    Err(_) => {}
-                }
-            }
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
-                if devices.is_empty() {
-                    return Ok(None);
-                } else {
-                    return Ok(Some(devices));
-                }
-            }
-
-            _ => {}
-        }
-    }
-}
-
 fn get_ipv4_packet<'a>(ether_packet: &'a EthernetPacket<'a>) -> Result<Ipv4Packet<'a>, ()> {
     if ether_packet.get_ethertype() == EtherTypes::Ipv4
         && let Some(ipv4_packet) = Ipv4Packet::new(ether_packet.payload())
@@ -382,70 +335,165 @@ fn get_udp_packet<'a>(ip_packet: &'a Ipv4Packet<'a>) -> Result<UdpPacket<'a>, ()
     Err(())
 }
 
-fn listen_on_raw_socket(
-    timeout: Duration,
-    interface: &String,
-) -> Result<Option<Vec<Device>>, MndpError> {
-    let interface_name = interface;
-    let interfaces = datalink::interfaces();
-    let interface = interfaces
-        .into_iter()
-        .find(|iface| iface.name == *interface_name)
-        .expect("Interface not found!");
+impl Listener {
+    pub fn new(config: MndpConfig) -> Result<Listener, MndpError> {
+        if config.interface.is_some() {
+            let interface_name = String::from(&config.interface.clone().unwrap());
+            let interfaces = datalink::interfaces();
+            let interface = interfaces
+                .iter()
+                .find(|iface| iface.name == *interface_name);
 
-    let config: Config = Config {
-        read_timeout: Some(timeout),
-        ..Default::default()
-    };
+            match interface {
+                Some(interface) => {
+                    let pnet_config = Config {
+                        read_timeout: Some(config.timeout),
+                        ..Default::default()
+                    };
 
-    let (_tx, mut rx) = match datalink::channel(&interface, config) {
-        Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
-        Ok(_) => return Err(MndpError::UnsupportedChannel),
-        Err(e) => return Err(MndpError::EthernetChannelError(e)),
-    };
+                    let (_tx, rx) = match datalink::channel(&interface, pnet_config) {
+                        Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
+                        Ok(_) => return Err(MndpError::UnsupportedChannel),
+                        Err(e) => return Err(MndpError::EthernetChannelError(e)),
+                    };
 
-    let mut devices: Vec<Device> = Vec::new();
+                    Ok(Self {
+                        config: config,
+                        socket: None,
+                        rx: Some(rx),
+                    })
+                }
+                None => {
+                    println!("interface not found!");
+                    println!("avaialable interface:");
+                    interfaces
+                        .into_iter()
+                        .map(|interface| println!("  -   {interface}"));
 
-    loop {
-        match rx.next() {
-            Ok(packet) => {
-                let Some(ethernet_packet) = EthernetPacket::new(packet) else {
-                    continue;
-                };
-                let Ok(ipv4_packet) = get_ipv4_packet(&ethernet_packet) else {
-                    continue;
-                };
-                let Ok(udp_packet) = get_udp_packet(&ipv4_packet) else {
-                    continue;
-                };
-                if udp_packet.get_destination() == 5678 {
-                    match decode(udp_packet.payload()) {
-                        Ok(mndp_packet) => {
-                            devices.push(mndp_packet);
-                        }
-                        Err(_) => {}
-                    }
+                    return Err(MndpError::InterfaceNotFound);
                 }
             }
-
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
-                if devices.is_empty() {
-                    return Ok(None);
-                } else {
-                    return Ok(Some(devices));
-                }
-            }
-            _ => {}
+        } else {
+            let addr: SocketAddr = MNDP_LISTEN_PORT
+                .parse()
+                .map_err(MndpError::ParseAddrError)?;
+            let domain = if addr.is_ipv4() {
+                Domain::IPV4
+            } else {
+                Domain::IPV6
+            };
+            let socket =
+                Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).map_err(MndpError::Other)?;
+            Ok(Self {
+                config: config,
+                socket: Some(socket),
+                rx: None,
+            })
         }
     }
-}
 
-impl Listener {
-    pub fn new(config: MndpConfig) -> Self {
-        Self { config }
+    fn bind_socket(&mut self) -> Result<(), MndpError> {
+        let addr: SocketAddr = MNDP_LISTEN_PORT
+            .parse()
+            .map_err(MndpError::ParseAddrError)?;
+
+        if let Some(socket) = &self.socket {
+            socket.set_reuse_address(true).map_err(MndpError::Other)?;
+            socket.bind(&addr.into()).map_err(MndpError::Other)?;
+        }
+
+        Ok(())
     }
 
-    pub fn start_discovery_stream(&self) -> mpsc::Receiver<Device> {
+    fn listen(&mut self, timeout: Duration) -> Result<Option<Vec<Device>>, MndpError> {
+        self.bind_socket()?;
+        if let Some(socket) = &self.socket {
+            socket
+                .set_read_timeout(Some(timeout))
+                .map_err(MndpError::Other)?;
+
+            let mut buff = Vec::with_capacity(1024);
+            let mut devices: Vec<Device> = Vec::new();
+
+            loop {
+                match socket.recv_from(buff.spare_capacity_mut()) {
+                    Ok((readed, _peer)) => {
+                        unsafe {
+                            buff.set_len(readed);
+                        }
+
+                        match decode(&buff[..]) {
+                            Ok(mndp_packet) => {
+                                devices.push(mndp_packet);
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    Err(e)
+                        if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+                    {
+                        if devices.is_empty() {
+                            return Ok(None);
+                        } else {
+                            return Ok(Some(devices));
+                        }
+                    }
+
+                    _ => {}
+                }
+            }
+        } else {
+            Err(MndpError::UnsupportedChannel)
+        }
+    }
+
+    fn listen_on_raw_socket(&mut self) -> Result<Option<Vec<Device>>, MndpError> {
+        let mut devices: Vec<Device> = Vec::new();
+
+        if let Some(rx) = &mut self.rx {
+            loop {
+                match rx.next() {
+                    Ok(packet) => {
+                        let Some(ethernet_packet) = EthernetPacket::new(packet) else {
+                            continue;
+                        };
+                        let Ok(ipv4_packet) = get_ipv4_packet(&ethernet_packet) else {
+                            continue;
+                        };
+                        let Ok(udp_packet) = get_udp_packet(&ipv4_packet) else {
+                            continue;
+                        };
+                        if udp_packet.get_destination() == 5678 {
+                            match decode(udp_packet.payload()) {
+                                Ok(mndp_packet) => {
+                                    devices.push(mndp_packet);
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+
+                    Err(e)
+                        if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+                    {
+                        if devices.is_empty() {
+                            return Ok(None);
+                        } else {
+                            return Ok(Some(devices));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            Err(MndpError::EthernetChannelError(Error::new(
+                ErrorKind::NotFound,
+                "interface not found",
+            )))
+        }
+    }
+
+    pub fn start_discovery_stream(mut self) -> mpsc::Receiver<Device> {
         let (tx, rx) = mpsc::channel::<Device>(100);
         let config = self.config.clone();
 
@@ -461,9 +509,9 @@ impl Listener {
                 let micro_timeout = Duration::from_millis(100);
 
                 let result = if config.interface.is_some() {
-                    listen_on_raw_socket(micro_timeout, config.interface.as_ref().unwrap())
+                    self.listen_on_raw_socket()
                 } else {
-                    bind_and_listen(micro_timeout)
+                    self.listen(micro_timeout)
                 };
 
                 if let Ok(Some(devices)) = result {
@@ -479,11 +527,11 @@ impl Listener {
         rx
     }
 
-    pub fn discover(&self) -> Result<Option<Vec<Device>>, MndpError> {
+    pub fn discover(&mut self) -> Result<Option<Vec<Device>>, MndpError> {
         if self.config.interface.is_some() {
-            listen_on_raw_socket(self.config.timeout, self.config.interface.as_ref().unwrap())
+            self.listen_on_raw_socket()
         } else {
-            bind_and_listen(self.config.timeout)
+            self.listen(self.config.timeout)
         }
     }
 }

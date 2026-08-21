@@ -58,19 +58,12 @@ fn parse_args(args: Vec<String>) -> MndpConfig {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
-    let listener: mndp_rs::Listener = mndp_rs::Listener::new(parse_args(args));
+    let listener: mndp_rs::Listener =
+        mndp_rs::Listener::new(parse_args(args)).expect("initializing mndp listener error");
     println!("Searching for mikrotik devices...");
     let mut device_rx = listener.start_discovery_stream();
-
-    loop {
-        tokio::select! {
-            Some(new_device) = device_rx.recv() => {
-                println!("Device: {:?}", new_device)
-            }
-            else => {
-                break;
-            }
-        }
+    while let Some(new_device) = device_rx.recv().await {
+        println!("Device: {:?}", new_device)
     }
 }
 
